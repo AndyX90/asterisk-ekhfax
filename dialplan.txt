@@ -1,0 +1,16 @@
+[ekhfaxsend]
+exten => 1,1,AGI(ekhfax.agi,sendfaxprepare)
+ same => n,SendFax(${FAXFILE})
+
+exten => h,1,AGI(ekhfax.agi,sendfaxcollect)
+
+exten => failed,1,AGI(ekhfax.agi,sendfaxfailed)
+
+[ekhfaxrecv]
+exten => 1,1,AGI(ekhfax.agi,recvfaxprepare)
+ same => n,ReceiveFax(${FAXFILE})
+
+exten => h,1,AGI(ekhfax.agi,recvfaxcollect)
+
+[from-internal-custom]
+exten => 800,1,Goto(ekhfaxrecv,1,1)

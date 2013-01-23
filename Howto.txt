@@ -1,0 +1,44 @@
+1. Install components
+	yum install php-imap
+	yum install ghostscript
+2. Create & chown spool directories
+	mkdir /var/spool/asterisk/ekhfaxin
+	mkdir /var/spool/asterisk/ekhfaxout
+	chown asterisk:asterisk /var/spool/asterisk/ekhfax*
+3. Install ImageMagick
+	- yum install ImageMagick
+	- yum install ImageMagick-devel
+	- yum install make
+	- pecl channel-update pecl.php.net
+	- pecl install imagick
+	- Modify php.ini
+		extension=imagick.so
+	- Create /etc/php.d/imagick.ini with content "extension=imagick.so"
+	- Install monotyped font from "Font\VeraMono.ttf"
+		- mkdir /usr/share/fonts/default/TrueType/
+		- Copy TTF into this directory
+4. Copy ekhfax components
+	- Copy to /var/lib/asterisk/agi-bin/
+		- ekhfax.agi
+		- ekhfaxconf.inc 
+		- class.phpmailer.php
+		- class.pop3.php
+		- class.smtp.php
+	- chown asterisk:asterisk /var/lib/asterisk/agi-bin/ekhfax*
+	- Copy VeraMono.ttf to /usr/share/fonts/default/TrueType/ (or use another font file you wish, just make sure it's monotyped)
+5. Merge dialplan.txt data into your extensions_custom.conf
+6. Schedule a cron job for asterisk on when to run this script
+	- crontab -u asterisk -e
+	- Add the following: "*/2 * * * * php -q /var/lib/asterisk/agi-bin/ekhfax.agi mainrun"
+	
+
+*** General ***
+1. Check all config parameters in ekhfaxconfig.inc
+	
+*** For receiving fax ***
+1. Add Misc. Destination to the extension (in the dialplan.txt it's 800) you configured to go into to custom context
+2. Add inbound route of fax number to the Misc. Destination
+3. Configure at least one entry in $vEKHFaxInConfigs in ekhfaxconfig.inc
+
+** For sending fax ***
+1. Add at least one entry in $vEKHFaxOutConfigs in ekhfaxconfig.inc

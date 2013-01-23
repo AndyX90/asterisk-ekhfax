@@ -1,0 +1,1692 @@
+#!/usr/bin/php -q
+<?php
+
+/* $Id: ekhfax.agi 100 2013-01-13 15:05:00Z namezero111111 $ */
+//Copyright (C) 2013 awato Software GmbH (aiwanowski@awato.com) 
+/*
+ * 
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version 2
+ * of the License, or (at your option) any later version.
+ * 
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+*/
+
+require_once("ekhfaxconfig.inc");
+require_once("phpagi.php");
+require_once("class.phpmailer.php");
+
+// AGI instance
+//$agi = new AGI();
+
+/* Global reason codes for call file failure
+   From http://www.voip-info.org/wiki/view/Asterisk+Reason+variable
+*/
+$vEKHFaxCallFailureReason = array(0 => "Remote end general error",
+								  1 => "Remote end hung up",
+								  3 => "Remote end didn't pick up call",
+								  5 => "Remote end busy",
+								  8 => "Route congestion");
+
+
+////////////// Main logic //////////////
+error_reporting(E_ERROR);
+
+if(2 == $argc)
+{
+	if(0 == strcasecmp($argv['1'], "mainrun"))
+	{
+		EKHFaxRun();
+	}
+	else if(0 == strcasecmp($argv['1'], "sendfaxprepare"))
+	{
+		EKHSendFaxPrepare();
+	}
+	else if(0 == strcasecmp($argv['1'], "sendfaxcollect"))
+	{
+		EKHSendFaxCollect();
+	}
+	else if(0 == strcasecmp($argv['1'], "sendfaxfailed"))
+	{
+		EKHSendFaxFailed();
+	}
+	else if(0 == strcasecmp($argv['1'], "recvfaxprepare"))
+	{
+		EKHRecvFaxPrepare();
+	}
+	else if(0 == strcasecmp($argv['1'], "recvfaxcollect"))
+	{
+		EKHRecvFaxCollect();
+	}
+	else
+	{
+		//$agi->verbose("Argument error - aborting");
+		return 1;
+	}
+}
+else
+{
+	//$agi->verbose("Argument error - aborting");
+	return 1;
+}
+
+return 0;
+
+
+////////////// Implementation //////////////
+function EKHFaxRun()
+{
+	global $szEKHFaxLockFile;
+	
+	// Check lock file
+	if(file_exists($szEKHFaxLockFile))
+	{
+		//$agi->verbose("Faxing already in progress - terminating");
+		return 1;
+	}
+	
+	// Open lock file
+	$hLockFile = fopen($szEKHFaxLockFile, 'w');
+	if(!$hLockFile)
+	{
+		//$agi->verbose("Warning: Lock file \"". $szEKHFaxLockFile ."\" cannot be created - mutexing disabled!!");
+	}
+
+	// Make sure save path has trailing slash (/)
+	if (substr($szEKHFaxOutSpoolDir, strlen($szEKHFaxOutSpoolDir) - 1) != '/')
+	{
+		$szEKHFaxOutSpoolDir .= '/';
+	}
+	
+	// Send faxes
+	EKHFaxRunSend();
+	// Receive faxes
+	EKHFaxRunRecv();
+	
+	// Unlink lock file
+	unlink($szEKHFaxLockFile);
+}
+
+function EKHFaxRunSend()
+{
+	global $agi;
+	global $szEKHFaxOutSpoolDir;
+	global $nEKHFaxMaxParallel;
+	
+	// 1. Get new data
+	// If this fails, it's ok to continue processing data that is still queued up
+	EKHFaxProcessMails();
+	
+	// 2. Get all meta files
+	$vQueued = glob($szEKHFaxOutSpoolDir . "*.meta");
+	
+	// 3. Determine number of faxes still in progess
+	$nNumInProgress = 0;
+	foreach($vQueued as $szFile)
+	{
+		$vMeta = array();
+		if(!EKHFaxOutMetaFromFile($szFile, $vMeta))
+		{
+			$nNumInProgress++;
+			continue;
+		}
+		
+		if(1 == $vMeta['scheduled'])
+		{
+			$nNumInProgress++;
+		}
+	}
+	
+	// 4. Iterate over all queued faxes
+	$nCanStart = $nEKHFaxMaxParallel - $nNumInProgress;
+	foreach($vQueued as $szFile)
+	{
+		if($nCanStart <= 0)
+		{
+			break;
+		}
+		
+		if(EKHProcessFaxOut($szFile))
+		{
+			$nCanStart--;
+		}
+	}
+
+
+	return true;
+}
+
+function EKHFaxRunRecv()
+{
+	global $szEKHFaxInSpoolDir;
+	
+	// 1. Get all incoming faxes
+	$vQueued = glob($szEKHFaxInSpoolDir . "*.meta");
+	
+	// 2. Iterate over all faxes and process
+	foreach($vQueued as $szFile)
+	{
+		EKHProcessFaxIn($szFile);
+	}
+	
+	return true;
+}
+
+
+function EKHProcessFaxOut($szMetaFile)
+{
+	global $nEKHFaxRetryInterval;
+	global $nEKHFaxNumTries;
+	global $nEKHFaxNotifyEvery;
+	
+	global $szEKHFaxOutSpoolDir;
+	global $szEKHFaxAstOutgoingDir;
+	
+	global $szEKHFaxOutContext;
+	
+	$vMeta = array();
+	if(!EKHFaxOutMetaFromFile($szMetaFile, $vMeta))
+	{
+		return false;
+	}
+	
+	// Check fax status
+	if(1 == $vMeta['success'])
+	{
+		// Send confirmation to sender
+		if(EKHFaxNotifiySender_Success($vMeta))
+		{
+			// Clean up
+			unlink($vMeta['attfile']);
+			unlink($szMetaFile);
+		}
+	}
+	// Fax not yet sent
+	else
+	{
+		// Check to see if we can reschedule yet
+		if(  (time() >= $vMeta['nextretry'])
+		   &&($vMeta['remainingtries'] > 0)
+		   &&(0 == $vMeta['scheduled']))
+		{	
+			// Get config for sender
+			$vCfg = EKHFaxOutGetConfig($vMeta['sender']);
+			if(!$vCfg)
+			{
+				if(EKHFaxNotifiySender_Error_Simple($szSender, "Unable to relay for " . $szSender))
+				{
+					// Clean up
+					unlink($vMeta['attfile']);
+					unlink($szMetaFile);
+					return false;
+				}
+			}
+			
+			// Notify sender of delay every 5 times
+			if(  ($vMeta['remainingtries'] != $nEKHFaxNumTries)
+			   &&(0 == (($nEKHFaxNumTries - $vMeta['remainingtries']) % $nEKHFaxNotifyEvery))
+			   &&(0 != $vMeta['remainingtries'])
+			   &&(0 != $nEKHFaxNotifyEvery))
+			{
+				EKHFaxNotifiySender_Delayed($vMeta);
+			}
+		
+			// Update data file
+			$vMeta['scheduled'] = 1;
+			$vMeta['nextretry'] = time() + $nEKHFaxRetryInterval;
+			EKHFaxOutMetaToFile($szMetaFile, $vMeta);
+			
+				// Generate call file
+			$szCall = "Channel: " . $vCfg['channel'] . "/" . $vMeta['number'] .
+					  "\nCallerid: " . $vCfg['callerid'] .
+					  "\nMaxRetries: 0" . 
+					  "\nWaitTime: 60" . 
+					  "\nContext: " . $szEKHFaxOutContext .
+					  "\nExtension: 1" .
+					  "\nPriority: 1" .
+					  "\nSetvar: EKHFAXMETAFILE=" . $szMetaFile  .
+					  "\nSetvar: EKHFAXMETANOTFOUND=0" .
+					  "\nSetvar: EKHFAXCALLFAILED=0" .
+					  "\n";
+			$szCallFile = $szEKHFaxOutSpoolDir . $vMeta['faxid'] . ".call";
+			$fp = @fopen($szCallFile, "w");
+			if(!$fp)
+			{
+				//$agi->verbose("Error creating call file \"" . $szCallFile . "\"");
+				return false;
+			}
+			
+			if(!@fwrite($fp, $szCall))
+			{
+				//$agi->verbose("Error writing to call file \"" . $szCallFile . "\"");
+				fclose($fp);
+				return false;
+			}
+			
+			fclose($fp);
+			
+			// Move call file to asterisk spool directory
+			// Disabled for testing
+			$szCommand = "mv \"" . $szCallFile . "\" \"" . $szEKHFaxAstOutgoingDir . $vMeta['faxid'] . ".call\"";
+
+			$szOutput = "";
+			$nRetVal  = 0;
+			exec($szCommand, $szOutput, $nRetVal);
+			
+			if(0 != $nRetVal)
+			{
+				//$agi->verbose("Error moving call file to outgoing -> \"" . $szOutput . "\"");
+				return false;
+			}
+					
+		}
+		// Maximum attempts made
+		else if(0 >= $vMeta['remainingtries'])
+		{
+			if(EKHFaxNotifiySender_Error($vMeta))
+			{
+				// Clean up
+				unlink($vMeta['attfile']);
+				unlink($szMetaFile);
+			}
+		}
+		
+	}
+	
+	return true;
+}
+
+function EKHProcessFaxIn($szMetaFile)
+{
+	global $szEKHFaxAdminEmail;
+	global $szEKHFaxInSpoolDir;
+	
+	// 1. Load meta file
+	$vMeta = array();
+
+	if(!EKHFaxInMetaFromFile($szMetaFile, $vMeta))
+	{
+		return false;
+	}
+
+	$vCfg = EKHFaxInGetConfig($vMeta['receiver']);
+	if(!$vCfg)
+	{
+		return false;
+	}
+
+	// 2. Convert to PDF
+	$szFileInAttConv = $szEKHFaxInSpoolDir . $vMeta['faxid'] . "." . $vCfg['resultpagetype'];
+
+	if(!EKHFaxConvertIncoming($vMeta, $vCfg, $szFileInAttConv))
+	{
+		return false;
+	}
+
+	// 3. Send to receiver
+	$szSourceFile = $vMeta['attfile'];
+	$vMeta['attfile'] = $szFileInAttConv;
+	$bRes = EKHFaxNotifiyReceiver_Success($vMeta, $vCfg);
+	if($bRes)
+	{
+		unlink($szSourceFile);
+		unlink($szMetaFile);
+	}
+	
+	unlink($szFileInAttConv);
+	return $bRes;
+}
+
+// This is the entry point from the call file
+function EKHRecvFaxPrepare()
+{
+	global $szEKHFaxInSpoolDir;
+	
+	$agi = new AGI();
+	$agi->verbose("Entered EKHRecvFaxPrepare()");
+	
+	$szUnique = uniqid("ekhfax", true);
+	$szFileOutAtt = $szEKHFaxInSpoolDir . $szUnique . ".tiff";
+	$szFileOutMeta = $szEKHFaxInSpoolDir . $szUnique . ".meta";
+	
+	$agi->set_variable("EKHFAXINPREPERROR", 0);
+	
+	$vRes = $agi->get_variable("CALLERID(dnid)", true);
+	$szReceiver = $vRes['data'];
+	
+	// If not via DNID, check the FreePBX variable __FROM_DID
+	if(0 == strlen($szReceiver))
+	{
+		$agi->verbose("DNID not set, falling back to __FROM_DID");
+		$vRes = $agi->get_variable("__FROM_DID");
+		if(1 == $vRes['result'])
+		{
+			$szReceiver = $vRes['data'];
+		}
+	}
+	
+	$vCfg = EKHFaxInGetConfig($szReceiver);
+
+	// Do not accept calls that we cannot match to a receiver
+	$agi->verbose("Receiver is " . $szReceiver);
+	if(!$vCfg)
+	{
+		$agi->hangup();
+		$agi->set_variable("EKHFAXINPREPERROR", 1);
+		$agi->verbose("Left EKHRecvFaxPrepare()");
+		return 0;
+	}
+	
+	// Set fax options
+	$agi->set_variable("FAXOPT(ecm)", $vCfg['ecm']);
+	$agi->set_variable("FAXOPT(headerinfo)", $vCfg['headerinfo']);
+	$agi->set_variable("FAXOPT(localstationid)", $vCfg['localstationid']);
+	$agi->set_variable("FAXOPT(minrate)", $vCfg['minrate']);
+	$agi->set_variable("FAXOPT(maxrate)", $vCfg['maxrate']);
+	$agi->set_variable("FAXFILE", $szFileOutAtt);
+	$agi->set_variable("EKHMETAFILE", $szFileOutMeta);
+	$agi->set_variable("EKHFAXSTARTTIME", time());
+	
+	// Write meta options
+	$vRes = $agi->get_variable("CALLERID(number)", true);
+	$vMeta['sender']	= $vRes['data'];
+	$vMeta['senderstationid'] = "";
+	$vMeta['receiver']	= $szReceiver;
+	$vMeta['attfile']	= $szFileOutAtt;
+	$vMeta['faxid']		= $szUnique;
+	$vMeta['time']		= time();
+	$vMeta['pages']		= 0;
+	$vMeta['rate']		= 0;
+	$vMeta['duration']	= 0;
+	$vMeta['ecm']		= $vCfg['ecm'];
+	
+	// Reject fax if we can't write the meta file
+	if(!EKHFaxInMetaToFile($szFileOutMeta, $vMeta))
+	{
+		$agi->set_variable("EKHFAXINPREPERROR", 1);
+		$agi->hangup();
+	}
+	
+	$agi->verbose("Left EKHRecvFaxPrepare()");
+	return 0;
+}
+
+// This is the entry point from the call file
+function EKHRecvFaxCollect()
+{
+	$agi = new AGI();
+	$agi->verbose("Entered EKHRecvFaxCollect()");
+	
+	$vRes = $agi->get_variable("EKHFAXINPREPERROR", true);
+	$nPrepError = intval($vRes['data']);
+	
+	$vRes = $agi->get_variable("FAXOPT(status)", true);
+	$szFaxStatus = $vRes['data'];
+	
+	$vRes = $agi->get_variable("EKHMETAFILE", true);
+	$szMetaFile = $vRes['data'];
+	
+	if(  (1 != $nPrepError)
+	   &&(0 == strcasecmp(trim($szFaxStatus), "SUCCESS")))
+	{
+		$vMeta = array();
+
+		if(!EKHFaxInMetaFromFile($szMetaFile, $vMeta))
+		{
+			$agi->verbose("Error reading meta information from " . $szMetaFile . " - not post processing fax");
+		}
+		else
+		{
+			$vRes = $agi->get_variable("FAXOPT(remotestationid)", true);
+			$vMeta['senderstationid'] = $vRes['data'];
+			if(0 == strlen($vMeta['senderstationid']))
+			{
+				$vMeta['senderstationid'] = "n/a";
+			}
+			
+			$vMeta['time']		= time();
+			$vRes = $agi->get_variable("FAXOPT(pages)", true);
+			$vMeta['pages']		= intval($vRes['data']);
+			$vRes = $agi->get_variable("FAXOPT(rate)", true);
+			$vMeta['rate']		= intval($vRes['data']);
+			$vRes = $agi->get_variable("EKHFAXSTARTTIME", true);
+			$vMeta['duration']	= intval($vMeta['time'] - intval($vRes['data']));
+			$vRes = $agi->get_variable("FAXOPT(ecm)", true);
+			$vMeta['ecm'] = $vRes['data'];
+			if(0 == strlen($vMeta['ecm']))
+			{
+				$vMeta['ecm'] = "n/a";
+			}
+			
+			if(!EKHFaxInMetaToFile($szMetaFile, $vMeta))
+			{
+				$agi->verbose("Error writing meta information to " . $szMetaFile . " - not processing fax");
+			}
+			
+		}
+	}
+	else
+	{
+		$agi->verbose("Fax status is " . $szStatus . " - not processing");
+		unlink($szMetaFile);
+	}
+	
+	$agi->verbose("Left EKHRecvFaxCollect()");
+	return 0;
+}
+
+// This is the entry point from the call file
+function EKHSendFaxPrepare()
+{
+	$agi = new AGI();
+	
+	$agi->verbose("Entered EKHSendFaxPrepare()");
+	
+	$vRes = $agi->get_variable("EKHFAXMETAFILE", true);
+	$szFile = $vRes['data'];
+	
+	if(!EKHFaxOutMetaFromFile($szFile, $vMeta))
+	{
+		$agi->verbose("Cannot load meta file: " . $szFile);
+		return false;
+	}
+	
+	$vCfg = EKHFaxOutGetConfig($vMeta['sender']);
+	if($vCfg)
+	{
+	/*
+		$vMeta['sender']
+		$vMeta['number']
+		$vMeta['recipnicename']
+		$vMeta['attfile']
+		$vMeta['remainingtries']
+		$vMeta['nextretry']
+		$vMeta['faxid']
+		$vMeta['success']
+		$vMeta['status']
+	*/
+	
+		// Set all fax options
+		$agi->set_variable("FAXFILE", $vMeta['attfile']);
+		$agi->set_variable("FAXOPT(ecm)", $vCfg['ecm']);
+		$agi->set_variable("FAXOPT(headerinfo)", $vCfg['headerinfo']);
+		$agi->set_variable("FAXOPT(localstationid)", $vCfg['localstationid']);
+		$agi->set_variable("FAXOPT(minrate)", $vCfg['minrate']);
+		$agi->set_variable("FAXOPT(maxrate)", $vCfg['maxrate']);
+		$agi->set_variable("EKHFAXSTARTTIME", time());
+		
+	}
+	else
+	{
+		$agi->set_variable("EKHFAXMETANOTFOUND", "1");
+		$agi->hangup();
+	}
+
+	$agi->verbose("Left EKHSendFaxPrepare()");
+	return 0;
+}
+
+// This is the entry point from the call file
+function EKHSendFaxCollect()
+{
+	$agi = new AGI();
+	
+	$agi->verbose("Entered EKHSendFaxCollect()");
+	
+	$vRes = $agi->get_variable("EKHFAXMETAFILE", true);
+	$szFile = $vRes['data'];
+	
+	$vMeta = array();
+	if(!EKHFaxOutMetaFromFile($szFile, $vMeta))
+	{
+		return 1;
+	}
+	
+	$vRes = $agi->get_variable("EKHFAXCALLFAILED", true);
+	$nCallFailed = intval($vRes['data']);
+	
+	if(0 == $nCallFailed)
+	{
+		$vRes = $agi->get_variable("EKHFAXMETANOTFOUND", true);
+		$nFaxError = intval($vRes['data']);
+		
+		if(1 == $nFaxError)
+		{
+			$vMeta['success'] = 0;
+			$vMeta['status']['result']	= "FAILED";
+			$vMeta['status']['message']	= "Cannot find config for sender \"" . $vMeta['sender'] . "\"";
+			$vMeta['status']['time']	= time();
+		}
+		else
+		{
+			$vRes = $agi->get_variable("EKHFAXSTARTTIME", true);
+			$nStartTime = intval($vRes['data']);
+			$nDuration = time() - $nStartTime;
+			$vRes = $agi->get_variable("FAXOPT(status)", true);
+			$szFaxStatus = $vRes['data'];
+			$vRes = $agi->get_variable("FAXOPT(statusstr)", true);
+			$szFaxStatusStr = $vRes['data'];
+			$vRes = $agi->get_variable("FAXOPT(error)", true);
+			$szFaxErrStr = $vRes['data'];
+			$vRes = $agi->get_variable("FAXOPT(pages)", true);
+			$szFaxNumPages = $vRes['data'];
+			$vRes = $agi->get_variable("FAXOPT(remotestationid)", true);
+			$szFaxRemoteStationID = $vRes['data'];
+			$vRes = $agi->get_variable("FAXOPT(rate)", true);
+			$szFaxSendRate = $vRes['data'];
+			$vRes = $agi->get_variable("FAXOPT(ecm)", true);
+			$szECMUsed = $vRes['data'];
+			
+			if(0 == strcasecmp(trim($szFaxStatus), "FAILED"))
+			{
+				$vMeta['success'] = 0;
+				$vMeta['status']['result']	= "FAILED";
+				$vMeta['status']['message']	= $szFaxErrStr;
+				$vMeta['status']['time']	= time();
+				$vMeta['remainingtries']--;
+			}
+			else
+			{
+				$vMeta['success'] = 1;
+				$vMeta['status']['result']		= "SUCCESS";
+				$vMeta['status']['pages']		= $szFaxNumPages;
+				$vMeta['status']['remoteid']	= $szFaxRemoteStationID;
+				$vMeta['status']['rate']		= $szFaxSendRate;
+				$vMeta['status']['message']		= $szFaxStatusStr;
+				$vMeta['status']['time']		= time();
+				$vMeta['status']['duration']	= $nDuration;
+				$vMeta['status']['ecmused']		= $szECMUsed;
+			}
+			
+			
+		}
+		
+		// Update data file
+		$vMeta['scheduled'] = 0;
+		EKHFaxOutMetaToFile($szFile, $vMeta);
+	}
+	
+	$agi->verbose("Left EKHSendFaxCollect()");
+	return 0;
+}
+
+// This is the entry point from the call file
+function EKHSendFaxFailed()
+{
+	global $vEKHFaxCallFailureReason;
+	
+	$agi = new AGI();
+	
+	$agi->verbose("Entered EKHsSendFaxFailed()");
+	
+	$vRes = $agi->get_variable("EKHFAXMETAFILE", true);
+	$szFile = $vRes['data'];
+	
+	$vMeta = array();
+	if(!EKHFaxOutMetaFromFile($szFile, $vMeta))
+	{
+		return 1;
+	}
+	
+	$vRes = $agi->get_variable("REASON", true);
+	$szError = $vRes['data'];
+	
+	$vMeta['success'] = 0;
+	$vMeta['status']['result']	= "FAILED";
+	$vMeta['status']['message']	= $szError . " - " . isset($vEKHFaxCallFailureReason[$szError]) ? $vEKHFaxCallFailureReason[$szError] : "no info available";
+	$vMeta['status']['time']	= time();
+	$vMeta['scheduled'] = 0;
+	$vMeta['remainingtries']--;
+	EKHFaxOutMetaToFile($szFile, $vMeta);
+	
+	// Call failed
+	$agi->set_variable("EKHFAXCALLFAILED", "1");
+	
+	$agi->verbose("Left EKHsSendFaxFailed()");
+	
+	return 0;
+}
+
+function EKHFaxNotifiySender_Error($vMeta)
+{
+	global $nEKHFaxNumTries;
+	
+	$vCfg = EKHFaxOutGetConfig($vMeta['sender']);
+	if(!$vCfg)
+	{
+		return false;
+	}
+	
+	if(strlen($vMeta['recipnicename']) > 0)
+	{
+		$szSubject = "Failed to send fax to " . $vMeta['recipnicename'] . " (" . $vMeta['number'] . ")";
+	}
+	else
+	{
+		$szSubject = "Failed to send fax to " . $vMeta['number'];
+	}
+	
+	// Set number of pages & duration to n/a
+	$vMeta['status']['pages'] = "n/a";
+	$vMeta['status']['duration'] = "n/a";
+	
+	$szBody = EKHFaxOutMetaToResultHeader($vMeta, $vCfg, false);
+	$vAtts = array();
+	
+	// Get output file name
+	$vInfo = pathinfo($vMeta['attfile']);
+	$szOutFile = $vInfo['dirname'] . "/" . $vInfo['filename'] . "_result." . $vCfg['resultpagetype'];
+	
+	if(!EKHFaxResultPagePrepare($vMeta, $vCfg, $szOutFile))
+	{
+		unlink($szOutFile);
+		return false;
+	}
+	
+	$vAtts = array();
+	$vAtts[] = $szOutFile;
+	$bRes = EKHFaxNotify($vMeta['sender'], $szSubject, $szBody, $vAtts);
+	
+	foreach($vAtts as $szFile)
+	{
+		unlink($szFile);
+	}
+	
+	return $bRes;
+}
+
+function EKHFaxNotifiySender_Error_Simple($szSender, $szMessage)
+{
+	$szSubject = "Failed to send fax";
+	$szBody = "Failed to send fax : " . $szMessage;
+	
+	return EKHFaxNotify($szSender, $szSubject, $szBody);
+}
+
+function EKHFaxNotifiySender_Delayed($vMeta)
+{
+	global $nEKHFaxNumTries;
+
+	/*
+		$vMeta['sender']
+		$vMeta['number']
+		$vMeta['recipnicename']
+		$vMeta['attfile']
+		$vMeta['remainingtries']
+		$vMeta['nextretry']
+		$vMeta['faxid']
+		$vMeta['success']
+		$vMeta['status']
+	*/
+	$szSubject = "Fax to " . $vMeta['recipnicename'] . " (" . $vMeta['number'] . ") delayed";
+	$szBody = "Fax to " . $vMeta['recipnicename'] . " (" . $vMeta['number'] . ") delayed" .
+			  "This is a notification only, and no user interaction is required. You will be notified to the final success or failure\n" . 
+			  "The fax has failed to send successfully " . ($nEKHFaxNumTries - $vMeta['remainingtries']) . " times.\n" .
+			  "It will be tried another " . $vMeta['remainingtries'] . " times.\n";
+	
+	return EKHFaxNotify($szSender, $szSubject, $szBody);
+}
+
+function EKHFaxNotifiySender_Success($vMeta)
+{
+	$vCfg = EKHFaxOutGetConfig($vMeta['sender']);
+	if(!$vCfg)
+	{
+		return false;
+	}
+	
+	if(strlen($vMeta['recipnicename']) > 0)
+	{
+		$szSubject = "Succeeded in sending fax to " . $vMeta['recipnicename'] . " (" . $vMeta['number'] . ")";
+	}
+	else
+	{
+		$szSubject = "Succeeded in sending fax to " . $vMeta['number'];
+	}
+	
+	$szBody = EKHFaxOutMetaToResultHeader($vMeta, $vCfg, false);
+	$vAtts = array();
+	
+	// Get output file name
+	$vInfo = pathinfo($vMeta['attfile']);
+	$szOutFile = $vInfo['dirname'] . "/" . $vInfo['filename'] . "_result." . $vCfg['resultpagetype'];
+	
+	if(!EKHFaxResultPagePrepare($vMeta, $vCfg, $szOutFile))
+	{
+		unlink($szOutFile);
+		return false;
+	}
+	
+	$vAtts = array();
+	$vAtts[] = $szOutFile;
+	$bRes = EKHFaxNotify($vMeta['sender'], $szSubject, $szBody, $vAtts);
+	
+	foreach($vAtts as $szFile)
+	{
+		unlink($szFile);
+	}
+	
+	return $bRes;
+}
+
+function EKHFaxNotifiyReceiver_Success($vMeta, $vCfg)
+{
+	$szSubject = "Received fax from " . $vMeta['senderstationid'] . "(" . $vMeta['sender'] . ")";
+	$szBody = "Received fax from " . $vMeta['senderstationid'] . "(" . $vMeta['sender'] . ")" .
+			  "\nTo   : " . $vMeta['receiver'] .
+			  "\nTime : " . date("c", $vMeta['time']) . 
+			  "\nPages: " . $vMeta['pages'] .
+			  "\nRate : " . $vMeta['rate'] .
+			  "\nDuration : " . gmdate("H:i:s", $vMeta['duration']) .
+			  "\nECM  : " . $vMeta['ecm'] .
+			  "\n";
+
+	$vAtts = array();
+	
+	$vAtts[] = $vMeta['attfile'];
+	$bRes = EKHFaxNotify($vCfg['email_to'], $szSubject, $szBody, $vAtts);
+		
+	return $bRes;
+}
+
+function EKHFaxNotifiyReceiver_Error_Simple($szReceiver, $szMessage)
+{
+	$szSubject = "Failed to receive fax";
+	$szBody = "Failed to receive fax : " . $szMessage;
+	
+	return EKHFaxNotify($szReceiver, $szSubject, $szBody);
+}
+
+function EKHFaxResultPagePrepare($vMeta, $vCfg, $szOutFile)
+{
+	global $szEKHFaxFontFile;
+		
+	try
+	{
+		$cSrcImage = new Imagick($vMeta['attfile'] . "[0]"); // [0] means index of first page only
+		$nSrcWidth = $cSrcImage->getImageWidth();
+		$nSrcHeight= $cSrcImage->getImageHeight();
+		
+		$cDestImage= new Imagick();
+		$cDestImage->newImage($nSrcWidth, $nSrcHeight, new ImagickPixel('white'));
+		
+		// Get text
+		$vszText = EKHFaxOutMetaToResultHeader($vMeta, $vCfg, true);
+		if(!$vszText)
+		{
+			return false;
+		}
+		
+		// Render text
+		$nFontSize = 30;
+		$nXOff = 10;
+		$nYOff = 40;
+		$nYSpacing = 5;
+
+		$cDraw = new ImagickDraw();
+		$cDraw->setFont($szEKHFaxFontFile);
+		$cDraw->setFontSize($nFontSize);
+		
+		// Decrease the fontsize until it fits on the page
+		$vTxtProps = $cDestImage->queryFontMetrics($cDraw, $vszText[0]);
+		$nMaxTxtSize = $nSrcWidth - ($nXOff * 2);
+		while($vTxtProps['textWidth'] > $nMaxTxtSize)
+		{
+			$nFontSize -= 2;
+			$cDraw->setFontSize($nFontSize);
+			$vTxtProps = $cDestImage->queryFontMetrics($cDraw, $vszText[0]);
+		}
+
+		$cDraw->setFillColor('black');
+		$cDraw->setTextUnderColor('white');
+
+		foreach($vszText as $s)
+		{
+			$cDestImage->annotateImage($cDraw, $nXOff, $nYOff, 0, $s);
+			$nYOff += $nYSpacing + $vTxtProps['textHeight'];
+		}
+		
+		if($vCfg['resultwithfirstpage'])
+		{
+			// Resize source
+			$nNewWidth = $nSrcWidth * $vCfg['pageresizefactor'];
+			$nNewHeight= $nSrcHeight * $vCfg['pageresizefactor'];
+			$cSrcImage->resizeImage($nNewWidth, $nNewHeight, imagick::FILTER_POINT, 0);
+			
+			// Draw onto destination
+			$cDestImage->compositeImage($cSrcImage, imagick::COMPOSITE_COPY, ($nSrcWidth - $nNewWidth)/2, $nYOff);
+		}
+		
+		$cDestImage->setImageFormat($vCfg['resultpagetype']);
+		$cDestImage->writeImage($szOutFile);
+		
+	}
+	catch(ImagickException $e)
+	{
+		return false;
+	}
+	
+	return true;
+}
+
+function EKHFaxInMetaToResultHeader($vMeta, $nPage)
+{
+	$szText = sprintf("From %-20.20s %-20.20s To %-20.20s Time %-25.25s p. %-5.5s %-8.8s %-5.5s",
+					  $vMeta['senderstationid'],
+					  "(" . $vMeta['sender'] . ")",
+					  $vMeta['receiver'],
+					  date("c", $vMeta['time']),
+					  $nPage . "/" . $vMeta['pages'],
+					  gmdate("H:i:s", $vMeta['duration']),
+					  (0==strcasecmp("yes", $vMeta['ecm'])? "ecm" : ""));
+	return $szText;
+}
+
+function EKHFaxOutMetaToResultHeader($vMeta, $vCfg, $bAsArray = false)
+{
+	global $nEKHFaxNumTries;
+/*
+			$vMeta['success'] = 1;
+			$vMeta['status']['result']		= "SUCCESS";
+			$vMeta['status']['pages']		= $szFaxNumPages;
+			$vMeta['status']['remoteid']	= $szFaxRemoteStationID;
+			$vMeta['status']['rate']		= $szFaxSendRate;
+			$vMeta['status']['message']		= $szFaxStatusStr;
+			$vMeta['status']['time']		= time();
+			$vMeta['status']['duration']	= $nDuration;
+			$vMeta['status']['ecmused']		= $szECMUsed;
+*/
+	$vszText	= array();
+	$vszText[]	= sprintf("+-%'--20.20s+-%'--20.20s+-%'--20.20s+-%'--25.25s+-%'--10.10s+-%'--10.10s+-%'--10.10s+",
+						  "", "", "", "", "", "", "");
+	$vszText[]	= sprintf("| %-20.20s| %-20.20s| %-20.20s| %-25.25s| %-10.10s| %-10.10s| %-10.10s| ",
+						  "From:",
+						  "From #:",
+						  "To:",
+						  "Time:",
+						  "Pages:",
+						  "Duration:",
+						  "Result:");
+	$vszText[]	= sprintf("+-%'--20.20s+-%'--20.20s+-%'--20.20s+-%'--25.25s+-%'--10.10s+-%'--10.10s+-%'--10.10s+",
+						  "", "", "", "", "", "", "");
+	$vszText[]	= sprintf("| %-20.20s| %-20.20s| %-20.20s| %-25.25s| %-10.10s| %-10.10s| %-10.10s| ",
+						  $vCfg['headerinfo'],
+						  $vCfg['localstationid'],
+						  $vMeta['number'],
+						  date("c", $vMeta['status']['time']),
+						  $vMeta['status']['pages'],
+						  gmdate("H:i:s", $vMeta['status']['duration']),
+						  $vMeta['status']['result']);
+	
+	if(0 != strcasecmp("SUCCESS", $vMeta['status']['result']))
+	{
+	$vszText[]	= sprintf("+-%'--20.20s+-%'--20.20s+-%'--20.20s+-%'--25.25s+-%'--10.10s+-%'--10.10s+-%'--10.10s+",
+						  "", "", "", "", "", "", "");
+		$vszText[]	= sprintf("| %-20.20s| %-20.20s| %-83.83s|",
+							  $vMeta['status']['result'],
+							  "Number of tries: " . $nEKHFaxNumTries,
+							  $vMeta['status']['message']);
+	}
+	
+	$vszText[]	= sprintf("+-%'--20.20s+-%'--20.20s+-%'--20.20s+-%'--25.25s+-%'--10.10s+-%'--10.10s+-%'--10.10s+",
+						  "", "", "", "", "", "", "");
+						  
+	if(!$bAsArray)
+	{
+		return implode("\n", $vszText);
+	}
+
+	return $vszText;
+}
+
+function EKHFaxNotify($szTo, $szSubject, $szBody, $vAttachments = array())
+{
+	global $szEKHFaxSMTPServer;
+	global $szEKHFaxSMTPFromAddr;
+	global $szEKHFaxSMTPFromName;
+	
+	$cMail = new PHPMailer();
+	$cMail->IsSMTP();
+	$cMail->IsHTML(false);
+	$cMail->Host	= $szEKHFaxSMTPServer;
+	$cMail->From	= $szEKHFaxSMTPFromAddr;
+	$cMail->FromName= $szEKHFaxSMTPFromName;
+	$cMail->AddAddress($szTo);
+	$cMail->Subject = $szSubject;
+	$cMail->Body	= $szBody;
+	
+	foreach($vAttachments as $szFile)
+	{
+		$cMail->AddAttachment($szFile);
+	}
+	
+	if(!$cMail->Send())
+	{
+		return false;
+	}
+	
+	return true;
+}
+
+/////
+# Coded By Jijo Last Update Date [Jan/19/06] (http://www.phpclasses.org/browse/package/2964.html)
+# Updated 2008-12-18 by Dustin Davis (http://nerdydork.com)
+# Customized 2013-01-19 by Andreas Iwanowski for EKHFax
+	# Utilized $savedirpath parameter
+	# Added delete_emails parameter
+function EKHFaxProcessMails()
+{
+	global $agi;
+	global $szEKHFaxOutSpoolDir;
+	global $szEKHFaxIMAPServer;
+	global $szEKHFaxIMAPUser;
+	global $szEKHFaxIMAPPass;
+	global $nEKHFaxNumTries;
+	
+	$mbox = imap_open($szEKHFaxIMAPServer, $szEKHFaxIMAPUser, $szEKHFaxIMAPPass);
+	if(!$mbox)
+	{
+		echo imap_last_error() . "\nYes, error\n";
+		//$agi->verbose("POP3 Error: " . imap_last_error());
+		return false;
+	}
+	
+	$message = array();
+	$message["attachment"]["type"][0] = "text";
+	$message["attachment"]["type"][1] = "multipart";
+	$message["attachment"]["type"][2] = "message";
+	$message["attachment"]["type"][3] = "application";
+	$message["attachment"]["type"][4] = "audio";
+	$message["attachment"]["type"][5] = "image";
+	$message["attachment"]["type"][6] = "video";
+	$message["attachment"]["type"][7] = "other";
+	
+	for ($jk = 1; $jk <= imap_num_msg($mbox); $jk++)
+	{
+		$structure = imap_fetchstructure($mbox, $jk); 
+		$headers = imap_headerinfo($mbox, $jk);
+		$parts = $structure->parts;
+		$fpos = 2;
+		
+		// Get sender
+		$szSender = "";
+		{
+			$v = get_object_vars($headers->from[0]);
+			$szSender = $v['mailbox'] . "@" . $v['host'];
+		}
+		
+		// Verify only one attachment
+		$nAttachments = 0;
+		for($i = 1; $i < count($parts); $i++)
+		{
+			$message["pid"][$i] = $i;
+			$part = $parts[$i];
+			if(0 == strcasecmp($part->disposition, "ATTACHMENT"))
+			{
+				$nAttachments++;
+				
+				if($nAttachments > 1)
+				{
+					if(EKHFaxNotifiySender_Error_Simple($szSender, "Failed to verify the number of attachments. Only one attachment per fax is allowed, and it must be provided in PDF format"))
+					{
+						imap_delete($mbox, $jk);
+					}
+					break;
+				}
+			}
+		}
+		
+		if(1 == $nAttachments)
+		{
+			for($i = 1; $i < count($parts); $i++)
+			{
+				$message["pid"][$i] = $i;
+				$part = $parts[$i];
+				
+				if(0 == strcasecmp($part->disposition, "ATTACHMENT"))
+				{
+					$message["type"][$i] = $message["attachment"]["type"][$part->type] . "/" . strtolower($part->subtype);
+					$message["subtype"][$i] = strtolower($part->subtype);
+					$ext = $part->subtype;
+					$params = $part->dparameters;
+					//$filename=$part->dparameters[0]->value;
+
+					// Verify valid number
+					$szSubject = trim($headers->subject);
+					$vParts = explode(" ", $szSubject);
+					$szNumber = trim($vParts[0]);
+					if(!EKHFaxVerifyValidNumber($szNumber))
+					{
+						if(EKHFaxNotifiySender_Error_Simple($szSender, "Fax number failed to verify: " . $szNumber))
+						{
+							imap_delete($mbox, $jk);
+						}
+						break;
+					}
+					
+						// Recipient nice name
+					$vParts[0] = "";
+					$szNiceName = implode(" ", $vParts);
+					
+					// Verify PDF file
+					$szFileName = $part->dparameters[0]->value;
+					if(!EKHFaxVerifyIsPDF($szFileName))
+					{
+						if(EKHFaxNotifiySender_Error_Simple($szSender, "Attachment failed to verify as PDF: " . $szFileName))
+						{
+							imap_delete($mbox, $jk);
+						}
+						break;
+					}
+					
+					$mege="";
+					$data="";
+					$mege = imap_fetchbody($mbox, $jk, $fpos);
+
+					$szUnique = uniqid("ekhfax", true);
+					$szFileOutAtt = $szEKHFaxOutSpoolDir . $szUnique . ".pdf";
+					$szFileOutAttConv = $szEKHFaxOutSpoolDir . $szUnique . ".tiff";
+					$szFileOutMeta = $szEKHFaxOutSpoolDir . $szUnique . ".meta";
+					
+					// Write attachment file
+					$fp = @fopen($szFileOutAtt, "w");
+					
+					if(!$fp)
+					{
+						if(EKHFaxNotifiySender_Error_Simple($szSender, "Unable to open file for writing: " . $szFileOutAtt))
+						{
+							imap_delete($mbox, $jk);
+						}
+						break;
+					}
+					
+					$data = MailGetDecodedValue($mege, $part->type);	
+					if(!@fwrite($fp, $data))
+					{
+						if(EKHFaxNotifiySender_Error_Simple($szSender, "Failed to write to file: " . $szFileOutAtt))
+						{
+							imap_delete($mbox, $jk);
+						}
+						fclose($fp);
+						unlink($szFileOutAtt);
+						break;
+					}
+					
+					fclose($fp);
+					
+					
+					// Convert file
+					if(!EKHFaxConvertAttachment($szFileOutAtt, $szFileOutAttConv, $szSender))
+					{
+						unlink($szFileOutAtt);
+						break;
+					}
+					
+					// Original no longer needed
+					unlink($szFileOutAtt);
+					
+					// Write meta file
+					$vMeta = array();
+					$vMeta['sender'] = $szSender;
+					$vMeta['number'] = $szNumber;
+					$vMeta['recipnicename'] = $szNiceName;
+					$vMeta['attfile'] = $szFileOutAttConv;
+					$vMeta['remainingtries'] = $nEKHFaxNumTries;
+					$vMeta['nextretry'] = time(); // Now
+					$vMeta['faxid'] = $szUnique;
+					$vMeta['scheduled'] = 0;
+					$vMeta['success'] = 0;
+					$vMeta['status'] = array();
+					
+					if(!EKHFaxOutMetaToFile($szFileOutMeta, $vMeta))
+					{
+						EKHFaxNotifiySender_Error_Simple($szSender, "Fatal error writing to " . $szFileOutMeta);
+						fclose($fp);
+						unlink($szFileOutAtt);
+						break;
+					}
+				
+					fclose($fp);
+					
+					$fpos += 1;
+				}
+				
+			}
+		}
+		else
+		{
+			EKHFaxNotifiySender_Error_Simple($szSender, "No attachment found. Please attach a file in PDF format in order to send a fax");
+		}
+			
+		// imap_delete tags a message for deletion
+		imap_delete($mbox, $jk);
+	}
+	// imap_expunge deletes all tagged messages
+	imap_expunge($mbox);
+	imap_close($mbox);
+	
+	return true;
+}
+
+function MailGetDecodedValue($message,$coding)
+{
+	switch($coding) {
+		case 0:
+		case 1:
+			$message = imap_8bit($message);
+			break;
+		case 2:
+			$message = imap_binary($message);
+			break;
+		case 3:
+		case 5:
+			$message=imap_base64($message);
+			break;
+		case 4:
+			$message = imap_qprint($message);
+			break;
+	}
+	return $message;
+}
+
+function EKHFaxVerifyValidNumber(&$szNumber)
+{
+	$szNumber = trim($szNumber);
+	if(!preg_match("/^\\+?\\d+$/", $szNumber))
+	{
+		return false;
+	}
+	
+	return true;
+}
+
+function EKHFaxVerifyIsPDF(&$szFilename)
+{
+	$szFilename = trim($szFilename);
+	if(!preg_match("/[A-Za-z0-9]+\\.pdf/", $szFilename))
+	{
+		return false;
+	}
+	
+	return true;
+}
+
+// Notifies sender of error itself
+function EKHFaxConvertAttachment($szFileOutAtt, $szFileOutAttConv, $szSender)
+{
+	global $szEKHFaxGSWriter;
+	
+	$vCfg = EKHFaxOutGetConfig($szSender);
+	if(!$vCfg)
+	{
+		EKHFaxNotifiySender_Error_Simple($szSender, "Unable to relay for " . $szSender);
+		return false;
+	}
+	
+	// From Asterisk Fax manual:
+	//-q -dNOPAUSE -dBATCH -sDEVICE=tiffg4 -sPAPERSIZE=a4 -sOutputFile=<dest.tiff> <src.pdf>
+	/*$szCommand = $szEKHFaxGSWriter . " -q -dNOPAUSE -dBATCH -sDEVICE=tiffg4 -sPAPERSIZE=" . $vCfg["papersize"] .
+				 " -sOutputFile=\"" . $szFileOutAttConv . "\" \"" . $szFileOutAtt . "\"";
+				 */
+				 
+	//-q -dNOPAUSE -dBATCH -dSAFER -sDEVICE=tiffg3 -sOutputFile=output.tif -f input.pdf
+	$szCommand = $szEKHFaxGSWriter . " -q -dNOPAUSE -dBATCH -dSAFER -sDEVICE=tiffg3 -r204x196 -dFIXEDMEDIA -sPAPERSIZE=" . $vCfg["papersize"] .
+				 " -sOutputFile=\"" . $szFileOutAttConv . "\" \"" . $szFileOutAtt . "\"";
+
+	$szOutput = "";
+	$nRetVal  = 0;
+	exec($szCommand, $szOutput, $nRetVal);
+	
+	if(0 != $nRetVal)
+	{
+		EKHFaxNotifiySender_Error_Simple($szSender, "Failed to convert file: " . $szFileOutAtt . " with error: " . $szOutput);
+		unlink($szFileOutAttConv);
+		return false;
+	}
+	
+	return true;
+}
+/*
+function EKHFaxConvertIncoming($vMeta, $vCfg, $szFileInAttConv)
+{
+	global $szEKHFaxTiffToPSWriter;
+	global $szEKHFaxPS2PDFWriter;
+
+	// tiff2ps *.tif | ps2pdf13 - > test.pdf
+	$szCommand = $szEKHFaxTiffToPSWriter . " \"" . $vMeta['attfile'] . "\" | " . $szEKHFaxPS2PDFWriter . " - > \"" . $szFileInAttConv . "\"";
+	$szOutput = "";
+	$nRetVal  = 0;
+	exec($szCommand, $szOutput, $nRetVal);
+	
+	if(0 != $nRetVal)
+	{
+		EKHFaxNotifiySender_Error_Simple($vCfg['email_to'], "Failed to convert file: " . $vMeta['attfile'] . " with error: " . $szOutput);
+		unlink($szFileInAttConv);
+		return false;
+	}
+	
+	return true;
+}
+*/
+function EKHFaxConvertIncoming($vMeta, $vCfg, $szFileInAttConv)
+{
+	global $szEKHFaxFontFile;
+	
+	try
+	{
+		$cSrcImage = new Imagick($vMeta['attfile']);
+
+		$nPage = 1;
+		$nFrame = 0;
+		foreach($cSrcImage as $cFrame)
+		{
+			$szText = EKHFaxInMetaToResultHeader($vMeta, $nPage++);
+			if(0 == strlen(szText))
+			{
+				return false;
+			}
+			
+			// Render text
+			$nFontSize = 50;
+			$nYSpacing = 0;
+			$nXOff = 20;
+			$nYOff = 20;
+
+			$cDraw = new ImagickDraw();
+			$cDraw->setFont($szEKHFaxFontFile);
+			$cDraw->setFontSize($nFontSize);
+			
+			// Decrease the fontsize until it fits on the page
+			$nSrcWidth = $cSrcImage->getImageWidth();
+			$vTxtProps = $cSrcImage->queryFontMetrics($cDraw, $szText);
+			$nMaxTxtSize = $nSrcWidth - ($nXOff * 2);
+			while($vTxtProps['textWidth'] > $nMaxTxtSize)
+			{
+				$nFontSize -= 2;
+				$cDraw->setFontSize($nFontSize);
+				$vTxtProps = $cSrcImage->queryFontMetrics($cDraw, $szText);
+				$nYSpacing = $vTxtProps['textHeight'];
+			}
+			
+			$cDraw->setFillColor('black');
+			$cDraw->setTextUnderColor('white');
+			
+			$cSrcImage->annotateImage($cDraw, $nXOff, $nYOff, 0, $szText);
+			
+			// White line under text
+			$cDraw->setFillColor('white');
+			$cDraw->rectangle($nXOff, $nYOff + 2, $nXOff + $vTxtProps['textWidth'], $nYOff + 2 + $nYSpacing);
+			$cSrcImage->drawImage($cDraw);
+		}
+		
+		$cSrcImage->setImageFormat($vCfg['resultpagetype']);
+		$cSrcImage->writeImage($szFileInAttConv . "[" . $nFrame++ . "]");
+
+	}
+	catch(ImagickException $e)
+	{
+		return false;
+	}
+	
+	return true;
+}
+
+// Gets config for sender, or false if sender doesn't match any config
+function EKHFaxOutGetConfig($szSender)
+{
+	global $vEKHFaxOutConfigs;
+	
+
+	foreach($vEKHFaxOutConfigs as $vC)
+	{
+		foreach($vC["email_rgx"] as $szRgx)
+		{
+			if(1 == preg_match("/" . $szRgx . "/", $szSender))
+			{
+				return $vC;
+			}
+		}
+		
+	}
+	
+	return false;
+}
+
+function EKHFaxInGetConfig($szReceiver)
+{
+	global $vEKHFaxInConfigs;
+	
+	foreach($vEKHFaxInConfigs as $vC)
+	{
+		foreach($vC["numbers_rgx"] as $szRgx)
+		{
+			if(1 == preg_match("/" . $szRgx . "/", $szReceiver))
+			{
+				return $vC;
+			}
+		}
+		
+	}
+	
+	return false;
+}
+
+function EKHFaxOutMetaFromFile($szFile, &$vMeta)
+{
+	$fp = @fopen($szFile, "r");
+	
+	if(!$fp)
+	{
+		return false;
+	}
+
+	$szData = @fread($fp, 0x4000); // 16 kbytes is plenty to read
+	if(!$szData)
+	{
+		fclose($fp);
+		return false;
+	}
+	
+	fclose($fp);
+	
+	// Parse data
+	$vMeta = array();
+	$vTmp = array();
+	
+		// Sender
+	if(!preg_match("/sender=(.*)/", $szData, $vTmp))
+	{
+		return false;
+	}
+	$vMeta['sender'] = $vTmp[1];
+	
+		// Number
+	if(!preg_match("/number=(.*)/", $szData, $vTmp))
+	{
+		return false;
+	}
+	$vMeta['number'] = $vTmp[1];
+	
+		// Nice name of recipient
+	if(!preg_match("/recipnicename=(.*)/", $szData, $vTmp))
+	{
+		return false;
+	}
+	$vMeta['recipnicename'] = $vTmp[1];
+	
+		// File
+	if(!preg_match("/attfile=(.*)/", $szData, $vTmp))
+	{
+		return false;
+	}
+	$vMeta['attfile'] = $vTmp[1];
+		// Remaining Tries
+	if(!preg_match("/remainingtries=(\\d+)/", $szData, $vTmp))
+	{
+		return false;
+	}
+	$vMeta['remainingtries'] = intval($vTmp[1]);
+		// Next Retry time
+	if(!preg_match("/nextretry=(\\d+)/", $szData, $vTmp))
+	{
+		return false;
+	}
+	$vMeta['nextretry'] = intval($vTmp[1]);
+	
+		// Fax ID
+	if(!preg_match("/faxid=(.*)/", $szData, $vTmp))
+	{
+		return false;
+	}
+	$vMeta['faxid'] = $vTmp[1];
+	
+		// Scheduled
+	if(!preg_match("/scheduled=(\\d+)/", $szData, $vTmp))
+	{
+		return false;
+	}
+	$vMeta['scheduled'] = intval($vTmp[1]);
+	
+		// Sucess status
+	if(!preg_match("/success=(\\d)?/", $szData, $vTmp))
+	{
+		$vMeta['success'] = 0;
+	}
+	else
+	{
+		$vMeta['success'] = intval($vTmp[1]);
+	}
+	
+		// Status message
+	if(!preg_match("/status=(.*)?/", $szData, $vTmp))
+	{
+		$vMeta['status'] = array();
+	}
+	else
+	{
+		$vMeta['status'] = EKHFaxDecodeStatus($vTmp[1]);
+	}
+	
+	return true;
+}
+
+function EKHFaxOutMetaToFile($szFile, &$vMeta)
+{
+	global $agi;
+	
+	$fp = @fopen($szFile, "w");
+	
+	if(!$fp)
+	{
+		return false;
+	}
+	
+	$data = "sender=" . $vMeta['sender'] .
+			"\nnumber=" . $vMeta['number'] .
+			"\nrecipnicename=" . $vMeta['recipnicename'] .
+			"\nattfile=" . $vMeta['attfile'] .
+			"\nremainingtries=" . $vMeta['remainingtries'] .
+			"\nnextretry=" . $vMeta['nextretry'] .
+			"\nfaxid=" . $vMeta['faxid'] .
+			"\nscheduled=" . $vMeta['scheduled'] .
+			"\nsuccess=" . $vMeta['success'] .
+			"\nstatus=" . EKHFaxEncodeStatus($vMeta['status']) .
+			"\n";
+	
+	if(!@fwrite($fp, $data))
+	{
+		fclose($fp);
+		unlink($szFile);
+		return false;
+	}
+	
+	fclose($fp);
+	
+	return true;
+}
+
+function EKHFaxEncodeStatus($vStatus)
+{
+	$szOut = "";
+	foreach($vStatus as $k => $v)
+	{
+		$szOut .= base64_encode($k . "|" . $v) . "|";
+	}
+	
+	return rtrim($szOut, "|");
+}
+
+function EKHFaxDecodeStatus($szStatus)
+{
+	$vOut = array();
+	
+	$vData = explode("|", $szStatus);
+	
+	foreach($vData as $d)
+	{
+		$vTmp = explode("|", base64_decode($d));
+		
+		if(2 == count($vTmp))
+		{
+			$vOut[$vTmp[0]] = $vTmp[1];
+		}
+		else
+		{
+			$vOut[$vTmp[0]] = "";
+		}
+	}
+	
+	return $vOut;
+}
+
+function EKHFaxInMetaFromFile($szFile, &$vMeta)
+{
+	$fp = @fopen($szFile, "r");
+	
+	if(!$fp)
+	{
+		return false;
+	}
+
+	$szData = @fread($fp, 0x4000); // 16 kbytes is plenty to read
+	if(!$szData)
+	{
+		fclose($fp);
+		return false;
+	}
+	
+	fclose($fp);
+	
+	// Parse data
+	$vMeta = array();
+	$vTmp = array();
+	
+		// Sender
+	if(!preg_match("/sender=(.*)/", $szData, $vTmp))
+	{
+		return false;
+	}
+	$vMeta['sender'] = $vTmp[1];
+	
+		// Sender Station ID
+	if(!preg_match("/senderstationid=(.*)/", $szData, $vTmp))
+	{
+		return false;
+	}
+	$vMeta['senderstationid'] = $vTmp[1];
+	
+		// Receiver
+	if(!preg_match("/receiver=(.*)/", $szData, $vTmp))
+	{
+		return false;
+	}
+	$vMeta['receiver'] = $vTmp[1];
+
+		// Attfile
+	if(!preg_match("/attfile=(.*)/", $szData, $vTmp))
+	{
+		return false;
+	}
+	$vMeta['attfile'] = $vTmp[1];
+	
+		// Fax ID
+	if(!preg_match("/faxid=(.*)/", $szData, $vTmp))
+	{
+		return false;
+	}
+	$vMeta['faxid'] = $vTmp[1];
+	
+		// Time
+	if(!preg_match("/time=(.*)/", $szData, $vTmp))
+	{
+		return false;
+	}
+	$vMeta['time'] = $vTmp[1];
+	
+		// Pages received
+	if(!preg_match("/pages=(\\d+)/", $szData, $vTmp))
+	{
+		return false;
+	}
+	$vMeta['pages'] = intval($vTmp[1]);
+	
+		// Duration
+	if(!preg_match("/duration=(\\d+)/", $szData, $vTmp))
+	{
+		return false;
+	}
+	$vMeta['duration'] = intval($vTmp[1]);
+	
+		// Data rate used
+	if(!preg_match("/rate=(\\d+)/", $szData, $vTmp))
+	{
+		return false;
+	}
+	$vMeta['rate'] = intval($vTmp[1]);
+	
+		// ECM used
+	if(!preg_match("/ecm=(.*)/", $szData, $vTmp))
+	{
+		return false;
+	}
+	$vMeta['ecm'] = $vTmp[1];
+		
+	return true;
+}
+
+function EKHFaxInMetaToFile($szFile, &$vMeta)
+{
+	$fp = @fopen($szFile, "w");
+	
+	if(!$fp)
+	{
+		return false;
+	}
+
+	$data = "sender=" . $vMeta['sender'] .
+			"\nsenderstationid=" . $vMeta['senderstationid'] .
+			"\nreceiver=" . $vMeta['receiver'] .
+			"\nattfile=" . $vMeta['attfile'] .
+			"\nfaxid=" . $vMeta['faxid'] .
+			"\ntime=" . $vMeta['time'] .
+			"\npages=" . $vMeta['pages'] .
+			"\nduration=" . $vMeta['duration'] .
+			"\nrate=" . $vMeta['rate'] .
+			"\necm=" . $vMeta['ecm'] .
+			"\n";
+	
+	if(!@fwrite($fp, $data))
+	{
+		fclose($fp);
+		unlink($szFile);
+		return false;
+	}
+	
+	fclose($fp);
+	
+	return true;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+?>

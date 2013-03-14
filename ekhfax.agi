@@ -869,6 +869,10 @@ function EKHFaxResultPagePrepare($vMeta, $vCfg, $szOutFile)
 	{
 		return false;
 	}
+	catch(ImagickDrawException $e)
+	{
+		return false;
+	}
 	
 	return true;
 }
@@ -1250,28 +1254,7 @@ function EKHFaxConvertAttachment($szFileOutAtt, $szFileOutAttConv, $szSender)
 	
 	return true;
 }
-/*
-function EKHFaxConvertIncoming($vMeta, $vCfg, $szFileInAttConv)
-{
-	global $szEKHFaxTiffToPSWriter;
-	global $szEKHFaxPS2PDFWriter;
 
-	// tiff2ps *.tif | ps2pdf13 - > test.pdf
-	$szCommand = $szEKHFaxTiffToPSWriter . " \"" . $vMeta['attfile'] . "\" | " . $szEKHFaxPS2PDFWriter . " - > \"" . $szFileInAttConv . "\"";
-	$szOutput = "";
-	$nRetVal  = 0;
-	exec($szCommand, $szOutput, $nRetVal);
-	
-	if(0 != $nRetVal)
-	{
-		EKHFaxNotifiySender_Error_Simple($vCfg['email_to'], "Failed to convert file: " . $vMeta['attfile'] . " with error: " . $szOutput);
-		unlink($szFileInAttConv);
-		return false;
-	}
-	
-	return true;
-}
-*/
 function EKHFaxConvertIncoming($vMeta, $vCfg, $szFileInAttConv)
 {
 	global $szEKHFaxFontFile;

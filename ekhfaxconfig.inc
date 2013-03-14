@@ -51,8 +51,6 @@ $szEKHFaxAdminEmail = "aiwanowski@awato.com"; // This isn't used currently, but 
 // Configure: Path for ghostscript, et al
 	// These should work without modification on a FreePBX distro (tested on CentOS 6.3)
 $szEKHFaxGSWriter = "/usr/bin/gs";
-$szEKHFaxTiffToPSWriter = "/usr/bin/tiff2ps";
-$szEKHFaxPS2PDFWriter = "/usr/bin/ps2pdf14";
 
 // Configure: Custom context for faxing outbound
 	// No need to modify unless you changed the context in dialplan.txt
